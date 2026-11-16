@@ -1,3 +1,11 @@
+> **Asciiverse edition.** Install and start it from [av](https://asciiverse.sh),
+> or unpack a release archive and run `asshteroids`. It plays right here
+> against computer pilots, and while it runs, friends on your network fly in
+> the same field with plain `ssh -p 2222 <your address>` (the start screen
+> shows the line). `asshteroids -offline` keeps the game to yourself,
+> `asshteroids -join <address>` joins a friend, `asshteroids -demo` watches
+> the computer fly. What changed from upstream is in [PATCHES.md](PATCHES.md).
+
 # ASSHTEROIDS
 
 A multiplayer terminal-based Asteroids game playable over SSH.
