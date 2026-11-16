@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"io"
+	"log"
 	"strings"
 	"time"
 	"unicode"
@@ -29,12 +30,24 @@ type Client struct {
 	username     string
 	termSizeFunc draw.TermSizeFunc
 	hudBuf       []byte // Reusable buffer for HUD text formatting
+
+	opts        ClientOptions
+	best        int
+	savedBest   int
+	loggedState GameState
+	loggedChat  bool
 }
 
 // ClientOptions configures the client.
 type ClientOptions struct {
 	TermSizeFunc draw.TermSizeFunc
 	Username     string
+
+	Demo       bool      // the computer flies this ship; any key ends it
+	NoIdleKick bool      // the player at this machine is never sent away for idling
+	Best       int       // best score so far, shown on the start screen
+	OnBest     func(int) // called with a new best score
+	Info       []string  // lines for the top of the start screen
 }
 
 // NewClient creates a new client connected to the given server.
@@ -45,6 +58,9 @@ func NewClient(gs server.GameServer, r *bufio.Reader, w io.Writer, opts ClientOp
 	}
 
 	handle := gs.RegisterClient(opts.Username)
+	if opts.Demo {
+		gs.SetAutopilot(handle.ID, true)
+	}
 	state := NewClientState()
 	state.termSizeFunc = termSizeFunc
 
@@ -81,6 +97,9 @@ func NewClient(gs server.GameServer, r *bufio.Reader, w io.Writer, opts ClientOp
 		inputStream:  input.StartStream(r),
 		username:     opts.Username,
 		termSizeFunc: termSizeFunc,
+		opts:         opts,
+		best:         opts.Best,
+		savedBest:    opts.Best,
 	}
 }
 
@@ -106,6 +125,9 @@ func (c *Client) Run() error {
 		// Handle screen resize
 		c.updateScreen()
 
+		// The world holds still from here until the frame is drawn
+		c.server.LockView()
+
 		// Handle game state
 		switch c.state.GameState {
 		case GameStateStart:
@@ -125,20 +147,35 @@ func (c *Client) Run() error {
 			draw.HideCursor(c.writer)
 		}
 
+		c.logTransitions()
+
 		// Draw frame
-		if err := c.drawFrame(); err != nil {
+		err := c.drawFrame()
+		c.server.UnlockView()
+		if err == nil {
+			// sending can wait on the network, so not while holding the world
+			err = c.chunkWriter.Flush()
+		}
+		if err != nil {
 			return err
 		}
 
 		// Frame timing
+		// the demo draws at half rate, which keeps its recording small
+		frameTime := config.ClientTargetFrameTime
+		if c.opts.Demo {
+			frameTime *= 2
+		}
 		elapsed := time.Since(frameStart)
-		if elapsed < config.ClientTargetFrameTime {
-			time.Sleep(config.ClientTargetFrameTime - elapsed)
+		if elapsed < frameTime {
+			time.Sleep(frameTime - elapsed)
 		}
 	}
 
 	// Unregister from server
 	c.server.UnregisterClient(c.handle.ID)
+	c.saveBest()
+	log.Printf("client %d quit score=%d best=%d", c.handle.ID, c.state.Score, c.best)
 
 	draw.ClearScreen(c.writer)
 	return nil
@@ -147,6 +184,23 @@ func (c *Client) Run() error {
 // processInput reads input and sends it to the server.
 func (c *Client) processInput() {
 	c.state.Input = input.ReadInput(c.inputStream)
+
+	// Session log: every key as it arrives, before anything acts on it
+	if len(c.state.Input.Pressed) > 0 {
+		log.Printf("keys client=%d state=%d %q", c.handle.ID, c.state.GameState, c.state.Input.Pressed)
+	}
+
+	// The demo plays itself; any key ends it
+	if c.opts.Demo {
+		if len(c.state.Input.Pressed) > 0 {
+			c.state.Running = false
+		}
+		return
+	}
+
+	if c.opts.NoIdleKick {
+		c.lastInput = time.Now()
+	}
 
 	if len(c.state.Input.Pressed) > 0 {
 		c.lastInput = time.Now()
@@ -251,6 +305,7 @@ func (c *Client) processServerEvents() {
 			}
 			switch event.Type {
 			case server.EventPlayerDied:
+				c.saveBest()
 				c.state.Lives--
 				c.state.GameState = GameStateDead
 				c.state.Player = nil
@@ -258,6 +313,9 @@ func (c *Client) processServerEvents() {
 				c.state.KilledBy = event.KilledBy
 			case server.EventScoreAdd:
 				c.state.Score += event.ScoreAdd
+				if c.state.Score > c.best {
+					c.best = c.state.Score
+				}
 			case server.EventServerShutdown:
 				c.state.GameState = GameStateShutdown
 				c.state.shutdownTimer = config.ShutdownDisplayTime.Seconds()
@@ -310,8 +368,12 @@ func (c *Client) updateStartState() {
 	if c.state.ChatOpen {
 		return // Chat consumes input; don't trigger game actions
 	}
-	if c.state.Input.Space || c.state.Input.Enter {
+	if c.opts.Demo || c.state.Input.Space || c.state.Input.Enter {
 		c.startGame()
+		// the server may not have taken the registration yet
+		if c.state.Player == nil {
+			c.state.GameState = GameStateStart
+		}
 	}
 }
 
@@ -357,7 +419,7 @@ func (c *Client) updateDeadState() {
 			c.state.RespawnTimeRemaining = 0
 		}
 	}
-	if (c.state.Input.Space || c.state.Input.Enter) && c.state.RespawnTimeRemaining <= 0 {
+	if (c.opts.Demo || c.state.Input.Space || c.state.Input.Enter) && c.state.RespawnTimeRemaining <= 0 {
 		c.startGame()
 	}
 }
@@ -395,5 +457,26 @@ func (c *Client) updateShutdownState() {
 	c.state.shutdownTimer -= c.state.delta.Seconds()
 	if c.state.shutdownTimer <= 0 {
 		c.state.Running = false
+	}
+}
+
+// saveBest hands a new best score to whoever keeps it.
+func (c *Client) saveBest() {
+	if c.best > c.savedBest && c.opts.OnBest != nil {
+		c.opts.OnBest(c.best)
+		c.savedBest = c.best
+	}
+}
+
+// logTransitions writes changes of screen and chat to the session log.
+func (c *Client) logTransitions() {
+	if c.state.GameState != c.loggedState {
+		names := map[GameState]string{GameStateStart: "start", GameStatePlaying: "playing", GameStateDead: "dead", GameStateShutdown: "shutdown"}
+		log.Printf("client %d %s -> %s score=%d lives=%d", c.handle.ID, names[c.loggedState], names[c.state.GameState], c.state.Score, c.state.Lives)
+		c.loggedState = c.state.GameState
+	}
+	if c.state.ChatOpen != c.loggedChat {
+		log.Printf("client %d chat open=%v", c.handle.ID, c.state.ChatOpen)
+		c.loggedChat = c.state.ChatOpen
 	}
 }

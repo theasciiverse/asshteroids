@@ -15,6 +15,11 @@ func NewAsteroidSpawner(target int) *AsteroidSpawner {
 	}
 }
 
+// AddTarget raises the number of rocks kept in the field.
+func (s *AsteroidSpawner) AddTarget(n int) {
+	s.target += n
+}
+
 // SpawnProtectionTime is how long new asteroids are invulnerable.
 const SpawnProtectionTime = 3.0
 

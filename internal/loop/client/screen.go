@@ -67,7 +67,7 @@ func (c *Client) drawFrame() error {
 	// Draw chat (overlays all screens)
 	c.drawChat(snapshot)
 
-	return c.chunkWriter.Flush()
+	return nil
 }
 
 // drawUI draws the game UI overlay.
@@ -256,8 +256,21 @@ func (c *Client) drawStartScreen(centerX, centerY int, snapshot *server.WorldSna
 		cw.WriteAt(centerX-len(prompt)/2, controlsY+len(controlLines)+2, prompt)
 	}
 
-	// Top scores (right of controls)
-	c.drawTopScores(cw, centerX+22, controlsY, snapshot.TopScores)
+	// Top scores (right of controls), kept inside narrow terminals
+	scoresCol := centerX + 22
+	if w := c.canvas.TerminalWidth(); scoresCol+22 > w {
+		scoresCol = w - 22
+	}
+	c.drawTopScores(cw, scoresCol, controlsY, snapshot.TopScores)
+
+	// This machine's best, and how friends join
+	if c.best > 0 {
+		best := "Your best: " + strconv.Itoa(c.best)
+		cw.WriteAt(centerX-len(best)/2, controlsY+len(controlLines)+3, best)
+	}
+	for i, line := range c.opts.Info {
+		cw.WriteAt(centerX-utf8.RuneCountInString(line)/2, 1+i, line)
+	}
 
 	// GitHub link (OSC 8 clickable hyperlink)
 	ghURL := "https://github.com/tomz197/asshteroids"
@@ -586,13 +599,13 @@ func (c *Client) drawDeadScreen(centerX, centerY int) {
 // drawShutdownScreen draws the server shutdown notification screen.
 func (c *Client) drawShutdownScreen(centerX, centerY int) {
 	cw := c.chunkWriter
-	title := "SERVER SHUTTING DOWN"
+	title := "THE GAME IS CLOSING"
 	cw.WriteAt(centerX-len(title)/2, centerY-3, title)
 
-	msg1 := "The server is restarting for maintenance."
+	msg1 := "The host has closed this game."
 	cw.WriteAt(centerX-len(msg1)/2, centerY-1, msg1)
 
-	msg2 := "Please reconnect in a moment."
+	msg2 := "Thanks for flying."
 	cw.WriteAt(centerX-len(msg2)/2, centerY, msg2)
 
 	remaining := int(c.state.shutdownTimer) + 1

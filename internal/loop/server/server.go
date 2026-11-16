@@ -3,6 +3,7 @@ package server
 import (
 	"cmp"
 	"context"
+	"log"
 	"math/rand"
 	"slices"
 	"strings"
@@ -25,6 +26,9 @@ type GameServer interface {
 	SendChatMessage(clientID int, text string)
 	GetSnapshot() *WorldSnapshot
 	GetClientPlayer(clientID int) *object.User
+	SetAutopilot(clientID int, on bool)
+	LockView()
+	UnlockView()
 	SpawnPlayer(clientID int)
 	RemovePlayer(clientID int)
 	ResetScore(clientID int)
@@ -41,12 +45,22 @@ type Server struct {
 	unregisterCh chan int
 	mu           sync.RWMutex
 
+	// frameMu keeps screens from drawing the world while a tick moves it:
+	// the snapshot holds the live objects, not copies
+	frameMu sync.RWMutex
+
 	// Double-buffered snapshot objects to avoid allocations
 	snapshotBufs [2][]object.Object
 	snapshotIdx  int
 
 	// Objects marked for removal (deferred compaction)
 	toRemove map[object.Object]struct{}
+
+	// The rocks kept in the field; computer pilots raise it
+	spawner *object.AsteroidSpawner
+
+	// Autopilot asked for before the client's registration came through
+	pendingAutopilot map[int]bool
 
 	// Reusable player set to avoid per-frame allocation
 	playerSet map[object.Object]struct{}
@@ -83,6 +97,9 @@ type ClientHandle struct {
 	BestScore            int              // Highest score achieved this session (never resets)
 	InvincibleTime       float64          // Remaining invincibility time in seconds
 	RespawnTimeRemaining float64          // Seconds until respawn is allowed (set on death)
+
+	brain *botBrain // set when the computer flies this ship
+	isBot bool      // a computer pilot, with no one at a terminal
 }
 
 // ClientInput represents input from a specific client.
@@ -128,6 +145,7 @@ func NewServer() *Server {
 		unregisterCh: make(chan int, 16),
 		chatChan:     make(chan chatMessageRequest, 32),
 		toRemove:     make(map[object.Object]struct{}),
+		spawner:      object.NewAsteroidSpawner(config.InitialAsteroidTarget),
 		playerSet:    make(map[object.Object]struct{}),
 	}
 
@@ -144,9 +162,12 @@ func NewServer() *Server {
 // Run starts the server loop. Blocks until the context is cancelled.
 func (s *Server) Run(ctx context.Context) {
 	lastTime := time.Now()
+	lastLog := lastTime
 
 	// Add asteroid spawner
-	s.world.AddObject(object.NewAsteroidSpawner(config.InitialAsteroidTarget))
+	s.frameMu.Lock()
+	s.world.AddObject(s.spawner)
+	s.frameMu.Unlock()
 
 	for {
 		select {
@@ -156,6 +177,7 @@ func (s *Server) Run(ctx context.Context) {
 		}
 
 		frameStart := time.Now()
+		s.frameMu.Lock()
 		s.world.Delta = frameStart.Sub(lastTime)
 		lastTime = frameStart
 
@@ -173,6 +195,13 @@ func (s *Server) Run(ctx context.Context) {
 
 		// Create new snapshot for clients
 		s.createSnapshot()
+		s.frameMu.Unlock()
+
+		// Session log: the whole field twice a second
+		if frameStart.Sub(lastLog) >= 500*time.Millisecond {
+			lastLog = frameStart
+			s.logState()
+		}
 
 		// Frame timing
 		elapsed := time.Since(frameStart)
@@ -207,7 +236,12 @@ func (s *Server) Shutdown(timeout time.Duration) {
 			return
 		case <-ticker.C:
 			s.mu.RLock()
-			remaining := len(s.clients)
+			remaining := 0
+			for _, h := range s.clients {
+				if !h.isBot {
+					remaining++
+				}
+			}
 			s.mu.RUnlock()
 			if remaining == 0 {
 				return
@@ -355,7 +389,12 @@ func (s *Server) processRegistrations() {
 		case handle := <-s.registerCh:
 			s.mu.Lock()
 			s.clients[handle.ID] = handle
+			if s.pendingAutopilot[handle.ID] {
+				handle.brain = newBotBrain()
+				delete(s.pendingAutopilot, handle.ID)
+			}
 			s.mu.Unlock()
+			log.Printf("client joined id=%d name=%q", handle.ID, handle.Username)
 		case clientID := <-s.unregisterCh:
 			s.mu.Lock()
 			if handle, ok := s.clients[clientID]; ok {
@@ -365,6 +404,7 @@ func (s *Server) processRegistrations() {
 				}
 				close(handle.EventsCh)
 				delete(s.clients, clientID)
+				log.Printf("client left id=%d name=%q", clientID, handle.Username)
 			}
 			s.mu.Unlock()
 		default:
@@ -410,7 +450,7 @@ func (s *Server) collectInputs() {
 	for {
 		select {
 		case ci := <-s.inputChan:
-			if handle, ok := s.clients[ci.ClientID]; ok {
+			if handle, ok := s.clients[ci.ClientID]; ok && handle.brain == nil {
 				handle.Input = ci.Input
 			}
 		default:
@@ -446,6 +486,9 @@ func (s *Server) updateWorld() {
 			}
 		}
 	}
+
+	// Computer pilots decide what to press
+	s.updateBots(dt)
 
 	// Update each player with their input
 	for _, handle := range s.clients {
@@ -624,6 +667,10 @@ func (s *Server) checkCollisions() {
 			if killerHandle != nil {
 				killedBy = killerHandle.Username
 			}
+			if handle.isBot && handle.brain != nil {
+				handle.brain.lives--
+			}
+			log.Printf("ship destroyed id=%d name=%q by=%q score=%d", handle.ID, handle.Username, killedBy, handle.Score)
 			select {
 			case handle.EventsCh <- ClientEvent{Type: EventPlayerDied, KilledBy: killedBy}:
 			default:
@@ -727,3 +774,53 @@ func (s *Server) buildTopScoresLocked() []TopScoreEntry {
 	copy(result, s.topScoresBuf[:n])
 	return result
 }
+
+// logState writes the field to the session log: every ship and the rocks.
+func (s *Server) logState() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	log.Printf("state objects=%d asteroids=%d clients=%d", len(s.world.Objects), s.world.AsteroidCount, len(s.clients))
+	for _, h := range s.clients {
+		kind := "person"
+		switch {
+		case h.isBot:
+			kind = "bot"
+		case h.brain != nil:
+			kind = "autopilot"
+		}
+		if h.Player == nil {
+			log.Printf("  ship id=%d name=%q %s down respawn=%.1f score=%d best=%d", h.ID, h.Username, kind, h.RespawnTimeRemaining, h.Score, h.BestScore)
+			continue
+		}
+		p := h.Player
+		log.Printf("  ship id=%d name=%q %s x=%.1f y=%.1f vx=%.1f vy=%.1f angle=%.2f invincible=%.1f score=%d best=%d keys=%s",
+			h.ID, h.Username, kind, p.X, p.Y, p.VX, p.VY, p.Angle, h.InvincibleTime, h.Score, h.BestScore, keysHeld(h.Input))
+	}
+}
+
+// keysHeld names the keys an input holds, for the log.
+func keysHeld(in object.Input) string {
+	k := ""
+	if in.Left {
+		k += "L"
+	}
+	if in.Right {
+		k += "R"
+	}
+	if in.Up || in.UpLeft || in.UpRight {
+		k += "T"
+	}
+	if in.Space {
+		k += "F"
+	}
+	if k == "" {
+		return "-"
+	}
+	return k
+}
+
+// LockView holds the world still while a screen draws it.
+func (s *Server) LockView() { s.frameMu.RLock() }
+
+// UnlockView lets the world move again.
+func (s *Server) UnlockView() { s.frameMu.RUnlock() }
